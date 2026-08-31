@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Wrangler local files and dev state
+.wrangler/
+.dev.vars
+.env
+.env.*
+
+# Output and temp files
+dist/
+output/
+.DS_Store
+Thumbs.db
+

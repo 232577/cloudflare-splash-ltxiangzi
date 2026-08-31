@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "ltxiangzi-splash-reminder",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-27",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "kv_namespaces": [
+    {
+      "binding": "SITE_CONFIG",
+      "id": "be07ab11588842e2a7169270d32ce3ea"
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "ltxiangzi.dpdns.org/*",
+      "zone_name": "ltxiangzi.dpdns.org"
+    }
+  ]
+}

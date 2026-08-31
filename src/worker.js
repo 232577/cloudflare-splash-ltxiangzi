@@ -1,6 +1,6 @@
 /**
  * Cloudflare Worker: ltxiangzi-splash-reminder
- * 公告提醒门禁服务与动态配置管理
+ * 包含：公告提醒门禁、动态短链接服务 (/s/*)、IP/网络探测 API (/api/ip) 与可视化管理控制台
  */
 
 const CONFIG_KEY = "site-config";
@@ -16,8 +16,15 @@ const defaultConfig = {
   contactHref: "mailto:2325778716@qq.com",
   officialSiteLabel: "进入正式站",
   officialSiteHref: "https://sevenseven.qzz.io/",
-  autoRedirectSeconds: 0, // 0 = 不开启，> 0 = 倒计时秒数
+  autoRedirectSeconds: 0,
   showQrCode: true,
+  shortlinks: {
+    "gh": "https://github.com/232577",
+    "site": "https://sevenseven.qzz.io/",
+    "mail": "mailto:2325778716@qq.com",
+    "ws": "https://github.com/232577/sevenseven-site",
+    "splash": "https://github.com/232577/cloudflare-splash-ltxiangzi"
+  },
   updatedAt: "2026-08-31"
 };
 
@@ -30,7 +37,7 @@ const SECURITY_HEADERS = {
 };
 
 function jsonResponse(data, init = {}) {
-  return new Response(JSON.stringify(data), {
+  return new Response(JSON.stringify(data, null, 2), {
     ...init,
     headers: {
       "content-type": "application/json; charset=utf-8",
@@ -60,7 +67,12 @@ async function readConfig(env) {
       return { ...defaultConfig };
     }
     const stored = await env.SITE_CONFIG.get(CONFIG_KEY, "json");
-    return { ...defaultConfig, ...(stored || {}) };
+    if (!stored) return { ...defaultConfig };
+    return {
+      ...defaultConfig,
+      ...stored,
+      shortlinks: { ...defaultConfig.shortlinks, ...(stored.shortlinks || {}) }
+    };
   } catch (err) {
     return { ...defaultConfig };
   }
@@ -95,35 +107,40 @@ function cleanConfig(input) {
     }
   }
 
-  if (!isValidUrl(output.contactHref)) {
-    output.contactHref = defaultConfig.contactHref;
-  }
-
-  if (!isValidUrl(output.officialSiteHref)) {
-    output.officialSiteHref = defaultConfig.officialSiteHref;
-  }
+  if (!isValidUrl(output.contactHref)) output.contactHref = defaultConfig.contactHref;
+  if (!isValidUrl(output.officialSiteHref)) output.officialSiteHref = defaultConfig.officialSiteHref;
 
   const redirectSec = Number.parseInt(input.autoRedirectSeconds, 10);
   output.autoRedirectSeconds = Number.isInteger(redirectSec) && redirectSec >= 0 && redirectSec <= 120 ? redirectSec : 0;
   output.showQrCode = input.showQrCode === true || input.showQrCode === "true" || input.showQrCode === 1;
-  output.updatedAt = new Date().toISOString().slice(0, 10);
 
+  output.shortlinks = {};
+  if (input.shortlinks && typeof input.shortlinks === "object") {
+    for (const [key, rawUrl] of Object.entries(input.shortlinks)) {
+      const cleanKey = String(key).trim().toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, 32);
+      const cleanTarget = String(rawUrl).trim();
+      if (cleanKey && isValidUrl(cleanTarget)) {
+        output.shortlinks[cleanKey] = cleanTarget;
+      }
+    }
+  }
+  if (Object.keys(output.shortlinks).length === 0) {
+    output.shortlinks = { ...defaultConfig.shortlinks };
+  }
+
+  output.updatedAt = new Date().toISOString().slice(0, 10);
   return output;
 }
 
 async function isAuthorized(request, env) {
-  if (!env || !env.ADMIN_TOKEN) {
-    return false;
-  }
+  if (!env || !env.ADMIN_TOKEN) return false;
 
   const auth = request.headers.get("authorization") || "";
   const headerToken = request.headers.get("x-admin-token") || "";
   const bearerToken = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   const token = bearerToken || headerToken.trim();
 
-  if (!token) {
-    return false;
-  }
+  if (!token) return false;
 
   const encoder = new TextEncoder();
   const [tokenHash, secretHash] = await Promise.all([
@@ -171,6 +188,77 @@ async function handleConfig(request, env) {
     await env.SITE_CONFIG.put(CONFIG_KEY, JSON.stringify(nextConfig));
   }
   return jsonResponse({ success: true, config: nextConfig });
+}
+
+function handleIpApi(request) {
+  const clientIp = request.headers.get("cf-connecting-ip") || 
+                   request.headers.get("x-real-ip") || 
+                   request.headers.get("x-forwarded-for") || 
+                   "127.0.0.1";
+  
+  const cf = request.cf || {};
+
+  const result = {
+    ip: clientIp,
+    country: cf.country || "CN",
+    city: cf.city || "Shanghai",
+    region: cf.region || "Shanghai",
+    timezone: cf.timezone || "Asia/Shanghai",
+    colo: cf.colo || "HKG",
+    asn: cf.asn || 0,
+    asOrganization: cf.asOrganization || "ISP",
+    httpProtocol: cf.httpProtocol || "HTTP/2",
+    tlsVersion: cf.tlsVersion || "TLSv1.3",
+    userAgent: request.headers.get("user-agent") || "",
+    timestamp: Date.now()
+  };
+
+  return jsonResponse(result);
+}
+
+function handleTimeApi() {
+  const now = Date.now();
+  const d = new Date(now);
+  const beijingTime = new Date(now + 8 * 3600 * 1000).toISOString().replace("T", " ").replace("Z", " +08:00");
+  
+  return jsonResponse({
+    timestamp_ms: now,
+    timestamp_s: Math.floor(now / 1000),
+    iso_utc: d.toISOString(),
+    beijing_time: beijingTime
+  });
+}
+
+async function handleShortlink(slug, request, env) {
+  const config = await readConfig(env);
+  const targetUrl = config.shortlinks ? config.shortlinks[slug] : null;
+
+  if (targetUrl && isValidUrl(targetUrl)) {
+    return Response.redirect(targetUrl, 302);
+  }
+
+  return htmlResponse(String.raw`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>短链接未找到 | ltxiangzi.dpdns.org</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0f172a; color: #f8fafc; font-family: sans-serif; text-align: center; }
+    .box { padding: 36px; border: 1px solid rgba(255,255,255,0.15); border-radius: 12px; background: rgba(30,41,59,0.7); max-width: 480px; }
+    h1 { color: #f43f5e; margin: 0 0 12px; }
+    p { color: #94a3b8; line-height: 1.6; }
+    a { display: inline-block; margin-top: 16px; padding: 10px 18px; background: #0ea5e9; color: white; border-radius: 6px; text-decoration: none; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>404 短链接未找到</h1>
+    <p>短链接标识 <code>/s/${slug}</code> 尚未注册或已被移动。</p>
+    <a href="/">返回首页</a>
+  </div>
+</body>
+</html>`);
 }
 
 const sharedStyles = String.raw`
@@ -326,7 +414,6 @@ const sharedStyles = String.raw`
   .panel strong { font-size: 15px; font-weight: 750; }
   .panel p { margin: 0; color: var(--muted); font-size: 14.5px; line-height: 1.7; }
 
-  /* 倒计时进度条 */
   .redirect-timer {
     display: none;
     margin-top: 24px;
@@ -419,7 +506,6 @@ const sharedStyles = String.raw`
   .footer-meta a { color: var(--faint); text-decoration: none; }
   .footer-meta a:hover { color: var(--brand); }
 
-  /* Toast Notification */
   .toast-container {
     position: fixed;
     bottom: 24px;
@@ -488,7 +574,6 @@ function publicPage() {
         <p id="status-text">正在载入中...</p>
       </section>
 
-      <!-- 智能自动跳转模块（配置开启时激活） -->
       <div class="redirect-timer" id="redirect-timer" role="timer" aria-live="polite">
         <div class="redirect-progress-box">
           <div class="redirect-text" id="redirect-text">将在 <span id="countdown-sec">5</span> 秒后自动跳转至正式站</div>
@@ -517,7 +602,6 @@ function publicPage() {
   <div class="toast-container" id="toast-container"></div>
 
   <script>
-    // Theme Management
     const themeToggle = document.querySelector("#theme-toggle");
     const savedTheme = localStorage.getItem("site-theme") || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     document.documentElement.setAttribute("data-theme", savedTheme);
@@ -530,7 +614,6 @@ function publicPage() {
       showToast(next === "dark" ? "已切换至深色模式 🌙" : "已切换至浅色模式 ☀️");
     });
 
-    // Toast Utility
     function showToast(msg) {
       const container = document.querySelector("#toast-container");
       const toast = document.createElement("div");
@@ -544,7 +627,6 @@ function publicPage() {
       }, 2500);
     }
 
-    // Elements & Config
     const button = document.querySelector("#acknowledge");
     const after = document.querySelector("#after-message");
     const redirectTimerBox = document.querySelector("#redirect-timer");
@@ -612,7 +694,6 @@ function publicPage() {
 
       document.querySelector("#stamp").textContent = "ltxiangzi.dpdns.org · Cloudflare Workers · " + (config.updatedAt || "");
 
-      // Handle auto-redirect if configured and not already acknowledged
       if (config.autoRedirectSeconds > 0 && sessionStorage.getItem("ltxiangzi-reminder-ack") !== "yes") {
         startAutoRedirect(config.autoRedirectSeconds, config.officialSiteHref);
       }
@@ -643,7 +724,6 @@ function publicPage() {
       showToast("感谢确认！");
     });
 
-    // Particle Canvas Animation with Theme Adaptation
     const canvas = document.querySelector(".scene");
     const context = canvas.getContext("2d");
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -705,16 +785,16 @@ function adminPage() {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex, nofollow">
-  <title>公告管理控制台 | ltxiangzi.dpdns.org</title>
+  <title>管理控制台 | ltxiangzi.dpdns.org</title>
   <style>
     ${sharedStyles}
     .admin-layout {
       display: grid;
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: 1.15fr 0.85fr;
       gap: 28px;
       margin-top: 24px;
     }
-    @media (max-width: 900px) {
+    @media (max-width: 960px) {
       .admin-layout { grid-template-columns: 1fr; }
     }
     .form-col, .preview-col {
@@ -722,25 +802,21 @@ function adminPage() {
       flex-direction: column;
       gap: 16px;
     }
-    .preview-card {
-      position: sticky;
-      top: 24px;
-      padding: 24px;
+    .card-section {
+      padding: 20px;
       border: 1px solid var(--line);
       border-radius: 12px;
       background: var(--paper-strong);
-      box-shadow: var(--shadow);
     }
-    .preview-title-bar {
+    .card-section-title {
+      font-size: 15px;
+      font-weight: 800;
+      margin-bottom: 14px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 16px;
-      padding-bottom: 8px;
-      border-bottom: 1px solid var(--line);
-      font-size: 13px;
-      font-weight: 700;
-      color: var(--muted);
     }
     label {
       display: flex;
@@ -749,6 +825,7 @@ function adminPage() {
       color: var(--muted);
       font-size: 13px;
       font-weight: 700;
+      margin-bottom: 12px;
     }
     input, textarea, select {
       width: 100%;
@@ -759,7 +836,6 @@ function adminPage() {
       color: var(--ink);
       font-family: inherit;
       font-size: 14px;
-      transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
     input:focus, textarea:focus {
       outline: none;
@@ -771,7 +847,7 @@ function adminPage() {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
-      margin-top: 8px;
+      margin-top: 14px;
     }
     .btn-secondary {
       background: var(--paper-strong);
@@ -779,131 +855,152 @@ function adminPage() {
       color: var(--ink);
     }
     .btn-secondary:hover { border-color: var(--brand); }
-    .btn-danger {
-      background: #ef4444;
-      color: white;
-      border: none;
-    }
-    .btn-danger:hover { background: #dc2626; }
     .helper-text { font-size: 11.5px; color: var(--faint); font-weight: normal; margin-top: -2px; }
-    .checkbox-row {
-      display: flex;
-      align-items: center;
+    
+    .shortlink-row {
+      display: grid;
+      grid-template-columns: 100px 1fr 40px;
       gap: 8px;
-      cursor: pointer;
-      font-weight: 600;
-      font-size: 13px;
+      align-items: center;
+      margin-bottom: 8px;
     }
-    .checkbox-row input { width: auto; }
+    .del-btn {
+      width: 36px;
+      height: 36px;
+      padding: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: transparent;
+      color: #ef4444;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    .del-btn:hover { background: rgba(239, 68, 68, 0.1); }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <main style="width: min(1080px, 100%);">
+    <main style="width: min(1140px, 100%);">
       <div class="top-bar">
-        <div class="status">管理控制台</div>
+        <div class="status">边缘微服务与门禁控制台</div>
         <div style="display: flex; gap: 8px; align-items: center;">
-          <a href="/" class="button-link" style="min-height: 36px; padding: 0 12px; font-size: 13px;">返回首页 ↗</a>
+          <a href="/" class="button-link" style="min-height: 36px; padding: 0 12px; font-size: 13px;">前台首页 ↗</a>
           <button type="button" class="theme-toggle" id="theme-toggle" title="切换深/浅色模式">🌓</button>
         </div>
       </div>
 
-      <h1 id="page-title" style="font-size: clamp(26px, 4vw, 38px); margin: 20px 0 8px;">编辑开屏公告与跳转策略</h1>
-      <p class="lead" style="font-size: 15px; margin: 0 0 20px;">修改配置后可实时在右侧预览。点击保存将持久化至 Cloudflare KV 存储。</p>
+      <h1 id="page-title" style="font-size: clamp(26px, 4vw, 36px); margin: 20px 0 8px;">配置公告内容、跳转策略与短链接</h1>
+      <p class="lead" style="font-size: 14.5px; margin: 0 0 20px;">修改配置后可在右侧实时预览。点击「保存并发布」将写入 Cloudflare KV 存储，全网毫秒级同步。</p>
 
       <div class="admin-layout">
-        <!-- 表单列 -->
-        <form class="form-col" id="form" novalidate>
-          <label>
-            管理口令 (ADMIN_TOKEN)
-            <input id="token" name="token" type="password" autocomplete="current-password" placeholder="输入 Worker 环境变量 ADMIN_TOKEN" required>
-            <span class="helper-text">口令保存在本地浏览器中，用于身份鉴权</span>
-          </label>
-
-          <label class="checkbox-row">
-            <input type="checkbox" id="remember-token" checked> 记住管理口令 (保存在本设备)
-          </label>
-
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-            <label>
-              状态徽章
-              <input name="badge" placeholder="例：开屏提醒" required>
+        <!-- 表单配置区 -->
+        <div class="form-col">
+          <!-- 身份鉴权卡片 -->
+          <div class="card-section">
+            <div class="card-section-title">🔑 管理口令 (ADMIN_TOKEN)</div>
+            <label style="margin-bottom: 8px;">
+              输入 Worker 环境变量口令
+              <input id="token" type="password" autocomplete="current-password" placeholder="输入口令 (如 232577aA..)" required>
             </label>
-            <label>
-              倒计时自动跳转 (秒)
-              <input name="autoRedirectSeconds" type="number" min="0" max="120" placeholder="0 表示不自动跳转">
-              <span class="helper-text">设为 5 时将显示 5 秒倒计时条</span>
+            <label style="flex-direction: row; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 0;">
+              <input type="checkbox" id="remember-token" checked style="width: auto;"> 记住管理口令 (保存在本地浏览器)
             </label>
           </div>
 
-          <label>
-            主标题
-            <input name="title" placeholder="例：站点入口正在调整" required>
-          </label>
+          <!-- 公告内容卡片 -->
+          <div class="card-section">
+            <div class="card-section-title">📢 开屏提醒与正文设置</div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+              <label>
+                状态徽章
+                <input id="cfg-badge" placeholder="例：开屏提醒" required>
+              </label>
+              <label>
+                倒计时自动跳转 (秒)
+                <input id="cfg-autoRedirectSeconds" type="number" min="0" max="120" placeholder="0 = 关闭自动跳转">
+                <span class="helper-text">设为 5 时将展示 5 秒倒计时</span>
+              </label>
+            </div>
 
-          <label>
-            公告正文说明
-            <textarea name="message" placeholder="详细公告内容..." required></textarea>
-          </label>
+            <label>
+              主标题
+              <input id="cfg-title" placeholder="例：站点入口正在调整" required>
+            </label>
 
-          <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 12px;">
             <label>
-              状态卡片标题
-              <input name="statusTitle" placeholder="当前状态" required>
+              公告正文说明
+              <textarea id="cfg-message" placeholder="详细公告内容..." required></textarea>
             </label>
+
+            <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 12px;">
+              <label>
+                状态卡片标题
+                <input id="cfg-statusTitle" placeholder="当前状态" required>
+              </label>
+              <label>
+                状态卡片内容
+                <textarea id="cfg-statusText" style="min-height: 48px;" placeholder="状态描述..." required></textarea>
+              </label>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+              <label>
+                主确认按钮文案
+                <input id="cfg-primaryLabel" placeholder="我已知悉" required>
+              </label>
+              <label>
+                正式站按钮文案
+                <input id="cfg-officialSiteLabel" placeholder="进入正式站" required>
+              </label>
+            </div>
+
             <label>
-              状态卡片内容
-              <textarea name="statusText" style="min-height: 50px;" placeholder="原页面状态及进展说明" required></textarea>
+              正式站链接 (URL)
+              <input id="cfg-officialSiteHref" type="url" placeholder="https://sevenseven.qzz.io/" required>
             </label>
+
+            <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 12px;">
+              <label>
+                联系按钮文案
+                <input id="cfg-contactLabel" placeholder="联系管理员" required>
+              </label>
+              <label>
+                联系链接 (mailto 或 URL)
+                <input id="cfg-contactHref" placeholder="mailto:2325778716@qq.com" required>
+              </label>
+            </div>
           </div>
 
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-            <label>
-              主确认按钮文案
-              <input name="primaryLabel" placeholder="我已知悉" required>
-            </label>
-            <label>
-              正式站按钮文案
-              <input name="officialSiteLabel" placeholder="进入正式站" required>
-            </label>
-          </div>
-
-          <label>
-            正式站链接 (URL)
-            <input name="officialSiteHref" type="url" placeholder="https://sevenseven.qzz.io/" required>
-          </label>
-
-          <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 12px;">
-            <label>
-              联系按钮文案
-              <input name="contactLabel" placeholder="联系管理员" required>
-            </label>
-            <label>
-              联系链接 (mailto 或 URL)
-              <input name="contactHref" placeholder="mailto:2325778716@qq.com" required>
-            </label>
+          <!-- 短链接管理卡片 -->
+          <div class="card-section">
+            <div class="card-section-title">
+              <span>⚡ 动态短链接映射 (/s/:slug)</span>
+              <button type="button" class="btn-secondary" id="add-shortlink-btn" style="min-height: 28px; padding: 0 10px; font-size: 12px;">+ 添加短链接</button>
+            </div>
+            <p class="helper-text" style="margin-bottom: 12px;">例如配置 key 为 <code>gh</code>，访问 <code>https://ltxiangzi.dpdns.org/s/gh</code> 将自动 302 重定向至对应目标地址。</p>
+            <div id="shortlinks-container"></div>
           </div>
 
           <div class="btn-group">
-            <button type="submit" class="primary" id="save-btn">保存并发布配置</button>
-            <button type="button" class="btn-secondary" id="export-btn">导出 JSON</button>
-            <button type="button" class="btn-secondary" id="import-btn">导入 JSON</button>
-            <button type="button" class="btn-secondary" id="reset-btn">重置为默认</button>
+            <button type="button" class="primary" id="save-btn" style="flex: 1;">保存并全网发布</button>
+            <button type="button" class="btn-secondary" id="export-btn">导出 JSON 备份</button>
+            <button type="button" class="btn-secondary" id="import-btn">导入 JSON 恢复</button>
+            <button type="button" class="btn-secondary" id="reset-btn">重置模板</button>
             <input type="file" id="file-input" accept=".json" style="display: none;">
           </div>
-        </form>
+        </div>
 
-        <!-- 实时预览列 -->
+        <!-- 实时预览区 -->
         <div class="preview-col">
-          <div class="preview-card">
-            <div class="preview-title-bar">
-              <span>实时效果预览 (所见即所得)</span>
-              <span id="preview-update-time">刚刚更新</span>
+          <div class="card-section" style="position: sticky; top: 24px;">
+            <div class="card-section-title">
+              <span>实时效果预览</span>
+              <span id="preview-update-time" style="font-size: 12px; color: var(--faint);">同步中</span>
             </div>
             
             <div class="status" id="pv-badge" style="margin-bottom: 12px;">开屏提醒</div>
-            <h2 id="pv-title" style="margin: 0 0 10px; font-size: 24px; font-weight: 800;">站点入口正在调整</h2>
-            <p id="pv-message" style="margin: 0 0 16px; color: var(--muted); font-size: 14px; line-height: 1.6;">公告内容预览</p>
+            <h2 id="pv-title" style="margin: 0 0 10px; font-size: 22px; font-weight: 800;">站点入口正在调整</h2>
+            <p id="pv-message" style="margin: 0 0 16px; color: var(--muted); font-size: 13.5px; line-height: 1.6;">公告内容预览</p>
 
             <div class="panel" style="margin-top: 12px; padding: 14px;">
               <strong id="pv-status-title" style="font-size: 13.5px;">当前状态</strong>
@@ -919,6 +1016,11 @@ function adminPage() {
               <a class="button-link" id="pv-official" style="min-height: 38px; padding: 0 12px; font-size: 13px;" href="#">进入正式站 ↗</a>
               <a class="button-link" id="pv-contact" style="min-height: 38px; padding: 0 12px; font-size: 13px;" href="#">联系管理员 ✉</a>
             </div>
+
+            <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--line);">
+              <div style="font-size: 13px; font-weight: 750; margin-bottom: 8px;">已生效的快捷短链接：</div>
+              <div id="pv-shortlinks-list" style="font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 6px;"></div>
+            </div>
           </div>
         </div>
       </div>
@@ -928,7 +1030,6 @@ function adminPage() {
   <div class="toast-container" id="toast-container"></div>
 
   <script>
-    // Theme Management
     const themeToggle = document.querySelector("#theme-toggle");
     const savedTheme = localStorage.getItem("site-theme") || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     document.documentElement.setAttribute("data-theme", savedTheme);
@@ -954,11 +1055,15 @@ function adminPage() {
       }, 2500);
     }
 
-    const form = document.querySelector("#form");
-    const token = document.querySelector("#token");
+    const tokenInput = document.querySelector("#token");
     const rememberToken = document.querySelector("#remember-token");
+    const shortlinksContainer = document.querySelector("#shortlinks-container");
 
-    // Preview elements
+    const fields = [
+      "badge", "title", "message", "statusTitle", "statusText",
+      "primaryLabel", "officialSiteLabel", "officialSiteHref", "contactLabel", "contactHref", "autoRedirectSeconds"
+    ];
+
     const pvBadge = document.querySelector("#pv-badge");
     const pvTitle = document.querySelector("#pv-title");
     const pvMessage = document.querySelector("#pv-message");
@@ -969,44 +1074,110 @@ function adminPage() {
     const pvContact = document.querySelector("#pv-contact");
     const pvRedirectPreview = document.querySelector("#pv-redirect-preview");
     const pvRedirectSec = document.querySelector("#pv-redirect-sec");
+    const pvShortlinksList = document.querySelector("#pv-shortlinks-list");
+
+    function renderShortlinkRow(key, url) {
+      key = key || "";
+      url = url || "";
+      const row = document.createElement("div");
+      row.className = "shortlink-row";
+      
+      const keyInput = document.createElement("input");
+      keyInput.className = "sl-key";
+      keyInput.placeholder = "如 gh";
+      keyInput.value = key;
+
+      const urlInput = document.createElement("input");
+      urlInput.className = "sl-url";
+      urlInput.placeholder = "如 https://github.com/...";
+      urlInput.value = url;
+
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "del-btn";
+      delBtn.title = "删除";
+      delBtn.textContent = "✕";
+      delBtn.addEventListener("click", () => {
+        row.remove();
+        updateLivePreview();
+      });
+
+      keyInput.addEventListener("input", updateLivePreview);
+      urlInput.addEventListener("input", updateLivePreview);
+
+      row.appendChild(keyInput);
+      row.appendChild(urlInput);
+      row.appendChild(delBtn);
+      shortlinksContainer.appendChild(row);
+    }
+
+    document.querySelector("#add-shortlink-btn").addEventListener("click", () => {
+      renderShortlinkRow("", "https://");
+      updateLivePreview();
+    });
+
+    function getFormData() {
+      const data = {};
+      for (const field of fields) {
+        const el = document.querySelector("#cfg-" + field);
+        if (el) data[field] = el.value;
+      }
+      data.shortlinks = {};
+      document.querySelectorAll(".shortlink-row").forEach(row => {
+        const k = row.querySelector(".sl-key").value.trim();
+        const u = row.querySelector(".sl-url").value.trim();
+        if (k && u) data.shortlinks[k] = u;
+      });
+      return data;
+    }
 
     function updateLivePreview() {
-      const fd = new FormData(form);
-      pvBadge.textContent = fd.get("badge") || "开屏提醒";
-      pvTitle.textContent = fd.get("title") || "主标题";
-      pvMessage.textContent = fd.get("message") || "正文内容...";
-      pvStatusTitle.textContent = fd.get("statusTitle") || "当前状态";
-      pvStatusText.textContent = fd.get("statusText") || "状态描述...";
-      pvPrimary.textContent = fd.get("primaryLabel") || "确认";
-      pvOfficial.textContent = (fd.get("officialSiteLabel") || "进入正式站") + " ↗";
-      pvContact.textContent = (fd.get("contactLabel") || "联系管理员") + " ✉";
+      const data = getFormData();
+      pvBadge.textContent = data.badge || "开屏提醒";
+      pvTitle.textContent = data.title || "主标题";
+      pvMessage.textContent = data.message || "正文内容...";
+      pvStatusTitle.textContent = data.statusTitle || "当前状态";
+      pvStatusText.textContent = data.statusText || "状态描述...";
+      pvPrimary.textContent = data.primaryLabel || "确认";
+      pvOfficial.textContent = (data.officialSiteLabel || "进入正式站") + " ↗";
+      pvContact.textContent = (data.contactLabel || "联系管理员") + " ✉";
 
-      const rSec = parseInt(fd.get("autoRedirectSeconds"), 10);
+      const rSec = parseInt(data.autoRedirectSeconds, 10);
       if (rSec > 0) {
         pvRedirectPreview.style.display = "block";
         pvRedirectSec.textContent = rSec;
       } else {
         pvRedirectPreview.style.display = "none";
       }
+
+      pvShortlinksList.innerHTML = "";
+      for (const [k, u] of Object.entries(data.shortlinks)) {
+        const item = document.createElement("div");
+        item.innerHTML = "<code>/s/" + k + "</code> → <a href='" + u + "' target='_blank' style='color: var(--brand);'>" + u + "</a>";
+        pvShortlinksList.appendChild(item);
+      }
     }
 
-    form.addEventListener("input", updateLivePreview);
+    document.querySelectorAll("input, textarea").forEach(el => el.addEventListener("input", updateLivePreview));
 
     function fillForm(config) {
-      for (const [key, value] of Object.entries(config)) {
-        const field = form.elements.namedItem(key);
-        if (field) {
-          field.value = value;
+      for (const field of fields) {
+        const el = document.querySelector("#cfg-" + field);
+        if (el && config[field] !== undefined) {
+          el.value = config[field];
+        }
+      }
+      shortlinksContainer.innerHTML = "";
+      if (config.shortlinks) {
+        for (const [k, u] of Object.entries(config.shortlinks)) {
+          renderShortlinkRow(k, u);
         }
       }
       const savedToken = localStorage.getItem("ltxiangzi-admin-token");
-      if (savedToken) {
-        token.value = savedToken;
-      }
+      if (savedToken) tokenInput.value = savedToken;
       updateLivePreview();
     }
 
-    // Load initial config
     fetch("/api/config")
       .then(res => res.json())
       .then(config => {
@@ -1015,16 +1186,11 @@ function adminPage() {
       })
       .catch(() => showToast("配置读取失败，请检查网络"));
 
-    // Save Form
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const data = Object.fromEntries(new FormData(form));
-      const adminToken = (data.token || "").trim();
-      delete data.token;
-
+    document.querySelector("#save-btn").addEventListener("click", async () => {
+      const adminToken = tokenInput.value.trim();
       if (!adminToken) {
         showToast("请输入管理口令后再保存");
-        token.focus();
+        tokenInput.focus();
         return;
       }
 
@@ -1034,9 +1200,10 @@ function adminPage() {
         localStorage.removeItem("ltxiangzi-admin-token");
       }
 
+      const payload = getFormData();
       const saveBtn = document.querySelector("#save-btn");
       saveBtn.disabled = true;
-      saveBtn.textContent = "正在保存中...";
+      saveBtn.textContent = "正在发布至全球边缘节点...";
 
       try {
         const res = await fetch("/api/config", {
@@ -1045,7 +1212,7 @@ function adminPage() {
             "content-type": "application/json",
             "authorization": "Bearer " + adminToken
           },
-          body: JSON.stringify(data)
+          body: JSON.stringify(payload)
         });
 
         const result = await res.json();
@@ -1055,19 +1222,17 @@ function adminPage() {
         }
 
         fillForm(result.config || result);
-        showToast("✓ 配置保存成功，首页已即时生效！");
+        showToast("✓ 配置保存成功，短链接与公告已即时生效！");
       } catch (err) {
         showToast("网络请求异常，请稍后重试");
       } finally {
         saveBtn.disabled = false;
-        saveBtn.textContent = "保存并发布配置";
+        saveBtn.textContent = "保存并全网发布";
       }
     });
 
-    // Export JSON
     document.querySelector("#export-btn").addEventListener("click", () => {
-      const data = Object.fromEntries(new FormData(form));
-      delete data.token;
+      const data = getFormData();
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -1078,7 +1243,6 @@ function adminPage() {
       showToast("配置文件已导出下载 📥");
     });
 
-    // Import JSON
     const fileInput = document.querySelector("#file-input");
     document.querySelector("#import-btn").addEventListener("click", () => fileInput.click());
     fileInput.addEventListener("change", (e) => {
@@ -1097,9 +1261,8 @@ function adminPage() {
       reader.readAsText(file);
     });
 
-    // Reset to Defaults
     document.querySelector("#reset-btn").addEventListener("click", () => {
-      if (confirm("确定要恢复默认公告配置吗？（需要点击保存才会生效）")) {
+      if (confirm("确定要恢复默认公告与短链接模板吗？（需要点击保存才会生效）")) {
         fillForm(${JSON.stringify(defaultConfig)});
         showToast("已重置为默认模板，请确认后点击保存");
       }
@@ -1112,6 +1275,21 @@ function adminPage() {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/s/")) {
+      const slug = url.pathname.slice(3).toLowerCase().trim();
+      if (slug) {
+        return handleShortlink(slug, request, env);
+      }
+    }
+
+    if (url.pathname === "/api/ip" || url.pathname === "/ip") {
+      return handleIpApi(request);
+    }
+
+    if (url.pathname === "/api/time") {
+      return handleTimeApi();
+    }
 
     if (url.pathname === "/api/config") {
       return handleConfig(request, env);
